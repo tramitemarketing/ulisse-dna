@@ -354,14 +354,24 @@ class Measures {
     this.cylGeo = new THREE.CylinderGeometry(1, 1, 1, 8);
     this.mat = new THREE.MeshBasicMaterial({ color: 0xff7b3a, depthTest: false, transparent: true, opacity: 0.95 });
     this.dotGeo = new THREE.SphereGeometry(1, 12, 10);
+    // linee guida tratteggiate, come nelle quote dei disegni tecnici
+    this.guideMat = new THREE.LineDashedMaterial({ color: 0xff9a62, dashSize: 0.7, gapSize: 0.5, transparent: true, opacity: 0.75, depthTest: false });
+    this.anchorMat = new THREE.MeshBasicMaterial({ color: 0xff9a62, transparent: true, opacity: 0.9, depthTest: false });
   }
-  add(a, b, caption, kind = "") {
+  // guides: [puntoDoveArrivaDaA, puntoDoveArrivaDaB] (funzioni), per le misure che stanno fuori dall'elica
+  add(a, b, caption, kind = "", guides = null) {
     const line = new THREE.Mesh(this.cylGeo, this.mat); line.renderOrder = 10;
     const d1 = new THREE.Mesh(this.dotGeo, this.mat), d2 = new THREE.Mesh(this.dotGeo, this.mat);
     d1.renderOrder = d2.renderOrder = 10;
     const lb = label("", "meas");
-    this.group.add(line, d1, d2, lb);
-    const it = { id: ++this.uid, a, b, caption, kind, line, d1, d2, lb, preset: presetTag };
+    const guide = new THREE.Group();
+    if (guides) for (let k = 0; k < 2; k++) {
+      const gl = new THREE.Line(new THREE.BufferGeometry(), this.guideMat); gl.renderOrder = 9;
+      const an = new THREE.Mesh(this.dotGeo, this.anchorMat); an.renderOrder = 9; an.scale.setScalar(0.34);
+      guide.add(gl, an);
+    }
+    this.group.add(line, d1, d2, lb, guide);
+    const it = { id: ++this.uid, a, b, caption, kind, line, d1, d2, lb, guide, guides, preset: presetTag };
     this.items.push(it);
     this.update(); renderMeasureList();
     return it;
@@ -378,11 +388,17 @@ class Measures {
       it.d1.position.copy(a); it.d2.position.copy(b);
       it.d1.scale.setScalar(0.28); it.d2.scale.setScalar(0.28);
       it.lb.position.copy(it.line.position);
+      if (it.guides) [a, b].forEach((p, k) => {
+        const to = new THREE.Vector3(...it.guides[k]());
+        const gl = it.guide.children[k * 2], an = it.guide.children[k * 2 + 1];
+        gl.geometry.setFromPoints([p, to]); gl.computeLineDistances();
+        an.position.copy(to);
+      });
       const w = it.kind === "groove" ? `<small>larghezza ${fmt(L - 5.8, 1)} Å (P–P − 5,8)</small>` : "";
       it.lb.element.classList.toggle("compact", it.kind === "hb");
       it.lb.element.innerHTML = it.kind === "hb" ? `${fmt(L, 2)} Å` : `${fmt(L, 2)} Å · ${fmt(L / 10, 3)} nm${it.caption ? `<small>${it.caption}</small>` : ""}${w}`;
       const vis = S.mode !== "replica";
-      for (const o of [it.line, it.d1, it.d2, it.lb]) o.visible = vis;
+      for (const o of [it.line, it.d1, it.d2, it.lb, it.guide]) o.visible = vis;
     }
     if (this.items.length) renderMeasureList();
   }
@@ -390,7 +406,8 @@ class Measures {
     const k = this.items.findIndex((x) => x.id === id);
     if (k < 0) return;
     const it = this.items[k];
-    this.group.remove(it.line, it.d1, it.d2, it.lb);
+    this.group.remove(it.line, it.d1, it.d2, it.lb, it.guide);
+    for (const o of it.guide.children) if (o.isLine) o.geometry.dispose();
     it.lb.element.remove();
     this.items.splice(k, 1);
     // tolta la misura di un solco, si spegne anche il suo colore
@@ -444,12 +461,13 @@ function addPresetInner(kind, quiet) {
   const cPitch = kind === "pitch" ? pickBp(c - 3) : 0;
   const cDiam = kind === "diam" ? pickBp(c - 9) : 0;
   if (kind === "rise") {
-    measures.add({ fn: () => [side(), 0, z(cRise)] }, { fn: () => [side(), 0, z(cRise + 1)] }, "salita tra due coppie");
+    const ctr = (bp) => () => S.frames[bp].t.slice(); // centro della coppia
+    measures.add({ fn: () => [side(), 0, z(cRise)] }, { fn: () => [side(), 0, z(cRise + 1)] }, "salita tra due coppie", "", [ctr(cRise), ctr(cRise + 1)]);
     focus(new THREE.Vector3(side(), 0, z(cRise)), 40);
   } else if (kind === "pitch") {
     // il giro intero sta dal lato opposto alla salita, centrato a metà elica
     const z0 = z(cPitch) - S.metrics.pitch / 2;
-    measures.add({ fn: () => [-side(), 0, z0] }, { fn: () => [-side(), 0, z0 + S.metrics.pitch] }, `un giro = ${fmt(S.metrics.bpPerTurn, 1)} coppie`);
+    measures.add({ fn: () => [-side(), 0, z0] }, { fn: () => [-side(), 0, z0 + S.metrics.pitch] }, `un giro = ${fmt(S.metrics.bpPerTurn, 1)} coppie`, "", [() => [0, 0, z0], () => [0, 0, z0 + S.metrics.pitch]]);
     frame();
   } else if (kind === "diam") {
     const p = top.idx(0, cDiam, "P");
@@ -1250,7 +1268,7 @@ function setMode(m) {
   if (!S.tour) $("#caption").hidden = m !== "replica";
   if (m !== "esplora" && S.ruler) setRuler(false);
   if (m !== "esplora" && S.selBp !== null) { S.selBp = null; dview.setDim(null); renderStrip(); }
-  for (const it of measures.items) for (const o of [it.line, it.d1, it.d2, it.lb]) o.visible = m !== "replica";
+  for (const it of measures.items) for (const o of [it.line, it.d1, it.d2, it.lb, it.guide]) o.visible = m !== "replica";
   for (const k of Object.keys(enzPool)) { enzPool[k].l.visible = false; }
   updateLabels();
   updateGrooves();
