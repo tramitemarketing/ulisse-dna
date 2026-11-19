@@ -72,7 +72,7 @@
   var quick = false;
   try { quick = sessionStorage.getItem("ulisse-seen") === "1"; } catch (e) {}
   // il liquido sale in un tempo minimo, così la dedica si legge anche sui computer veloci
-  var t0 = performance.now(), minMs = quick ? 2600 : 4800, shown = 0, target = 0.12, finished = false, closing = false;
+  var t0 = performance.now(), minMs = quick ? 1800 : 3000, shown = 0, target = 0.12, finished = false, closing = false;
   var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
   function paint(p) {
     lvl.setAttribute("transform", "translate(0 " + (125 - p * 64).toFixed(2) + ")");
@@ -103,7 +103,7 @@
     st.textContent = "Pronta. Buon viaggio!";
     try { sessionStorage.setItem("ulisse-seen", "1"); } catch (e) {}
     // il logo completo e la dedica restano un momento fermi, così si leggono
-    holdTimer = setTimeout(leave, reduce ? 900 : 1900);
+    holdTimer = setTimeout(leave, reduce ? 700 : quick ? 900 : 1200);
   }
   var holdTimer = null, gone = false;
   function leave() {
