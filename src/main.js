@@ -1398,6 +1398,9 @@ camera.rotation.order = "YXZ";
 function startFly() {
   if (S.mode === "scala" || S.flying) return;
   S.spinBeforeFly = +$("#rngSpin").value;
+  // la vista di prima del volo: uscendo si torna qui, con i comandi normali attorno all'elica
+  const back = S.tween ? { pos: S.tween.toP.clone(), target: S.tween.toT.clone() } : { pos: camera.position.clone(), target: controls.target.clone() };
+  S.preFly = back;
   setSpin(0);
   S.tween = null;
   S.flying = true;
@@ -1424,6 +1427,10 @@ function stopFly() {
   controls.target.copy(camera.position).addScaledVector(dir, 30);
   controls.enabled = S.mode !== "scala";
   $("#btnFly").lastChild.textContent = "Vola dentro l'elica";
+  // si torna con calma alla vista di prima, e la rotazione riparte se girava
+  if (S.preFly && S.mode !== "scala") S.tween = { t: 0, dur: 1, fromT: controls.target.clone(), toT: S.preFly.target, fromP: camera.position.clone(), toP: S.preFly.pos };
+  S.preFly = null;
+  if (S.spinBeforeFly > 0) setSpin(S.spinBeforeFly);
 }
 $("#btnFly").onclick = () => (S.flying ? stopFly() : startFly());
 $("#btnFlyExit").onclick = stopFly;
