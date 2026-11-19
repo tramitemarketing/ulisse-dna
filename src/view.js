@@ -58,6 +58,7 @@ export class MoleculeView {
     this.showBackbone = true;
     this.showBases = true;
     this.dimOthers = null; // Set di bp da evidenziare
+    this.pickHints = false; // righello acceso: si mostrano i punti da prendere anche nelle viste senza atomi
     this.sphereGeo = new THREE.SphereGeometry(1, 22, 14);
     this.cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12, 1, false);
     this.mat = withEdge(new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.05 }), EDGE.cartoon);
@@ -102,6 +103,9 @@ export class MoleculeView {
     this.group.add(this.ringMesh);
     this.atomScale = new Float32Array(nA).fill(1);
     this.hbVisible = new Uint8Array(hbonds.length).fill(1);
+    // con chi si appaia ogni nucleotide (per unire i due bastoncini di un piolo nella vista semplice)
+    this.partnerNt = new Int32Array(top.nts.length).fill(-1);
+    for (const [i, j] of hbonds) { const a = top.atoms[i].nt, b = top.atoms[j].nt; this.partnerNt[a] = b; this.partnerNt[b] = a; }
     this.strandStyle = top.strands.map((s, i) => (s.kind === "old" ? (i === 0 ? "old0" : "old1") : "new"));
     this.ntRNA = new Uint8Array(top.nts.length);
     this.recolor();
@@ -182,7 +186,11 @@ export class MoleculeView {
       else if (rep === "spacefill") r = ELEMENTS[at.el].vdw;
       // «Libro»: niente palline, solo giunture tonde grandi quanto i bastoncini, così i pezzi si raccordano
       // (sul C1′ quella del connettore verso lo scheletro, che altrimenti finirebbe tagliato netto)
-      else if (rep === "cartoon" && this.showBases) r = at.name === "C1'" ? (this.showBackbone ? 0.32 : 0.17) : at.isBase ? 0.17 : 0;
+      else if (rep === "cartoon" || rep === "simple") {
+        // col righello acceso si vedono i punti che si possono prendere: i fosfati come pallini sul nastro
+        if (this.pickHints && at.name === "P") r = 1.12;
+        else if (rep === "cartoon" && this.showBases) r = at.name === "C1'" ? (this.showBackbone ? 0.32 : 0.17) : at.isBase ? (this.pickHints ? 0.3 : 0.17) : 0;
+      }
       r *= this.atomScale[a];
       if (!this.layerOn(a)) r = 0;
       if (r === 0) { this.atomMesh.setMatrixAt(a, ZERO); continue; }
@@ -190,7 +198,7 @@ export class MoleculeView {
       _m.compose(_p, _q, _s); this.atomMesh.setMatrixAt(a, _m);
     }
     this.atomMesh.instanceMatrix.needsUpdate = true;
-    this.atomMesh.visible = rep !== "simple"; // nella vista «Semplice» gli atomi non si disegnano
+    this.atomMesh.visible = rep !== "simple" || this.pickHints; // nella vista «Semplice» gli atomi non si disegnano (solo i fosfati col righello)
     // --- legami ---
     let k = 0;
     for (const [i, j] of top.bonds) {
@@ -247,12 +255,14 @@ export class MoleculeView {
     ];
   }
 
-  // Vista «Semplice»: per ogni base un bastoncino dal nastro dello scheletro fino al bordo
-  // che si appaia, un po' più in là, così le due metà di un piolo quasi si toccano.
+  // Vista «Semplice»: per ogni base un bastoncino dal nastro dello scheletro verso il centro.
+  // Se la base è appaiata, i due bastoncini del piolo si incontrano a metà strada tra i due bordi
+  // che si legano (N1 della purina, N3 della pirimidina): il piolo è unito, non «penzola».
   updateSticks(pos) {
     const top = this.top;
     const show = this.rep === "simple" && this.showBases;
     const R = 0.62;
+    const e2v = new THREE.Vector3();
     for (let n = 0; n < top.nts.length; n++) {
       const nt = top.nts[n];
       const c1 = top.idx(nt.strand, nt.bp, "C1'");
@@ -262,11 +272,26 @@ export class MoleculeView {
       const t = this.showBackbone ? this.connectorTarget(nt, pos) : [pos[c1 * 3], pos[c1 * 3 + 1], pos[c1 * 3 + 2]];
       _a.set(t[0], t[1], t[2]);
       _b.set(pos[e * 3], pos[e * 3 + 1], pos[e * 3 + 2]);
-      _d.subVectors(_b, _a);
-      const L = _d.length();
-      _b.addScaledVector(_d, (0.5 / L) * s); // la punta va mezzo ångström oltre l'atomo del bordo
-      _b.lerpVectors(_a, _b, s); // durante la replicazione il bastoncino cresce dal nastro
+      // c'è il compagno, intero e davvero vicino (nella replicazione i filamenti si separano)?
+      let joined = false, capOn = true;
+      const pn = this.partnerNt[n];
+      if (pn >= 0 && s > 0.99) {
+        const pnt = top.nts[pn];
+        const e2 = top.idx(pnt.strand, pnt.bp, EDGE_ATOM[pnt.cls]), c2 = top.idx(pnt.strand, pnt.bp, "C1'");
+        e2v.set(pos[e2 * 3], pos[e2 * 3 + 1], pos[e2 * 3 + 2]);
+        if (Math.min(this.atomScale[e2], this.atomScale[c2]) > 0.99 && _b.distanceTo(e2v) < 4.2) {
+          _b.add(e2v).multiplyScalar(0.5); // punto d'incontro
+          joined = true;
+          capOn = n < pn; // una sola pallina nel punto d'incontro, se no due colori si sovrappongono
+        }
+      }
+      if (!joined) {
+        _d.subVectors(_b, _a);
+        _b.addScaledVector(_d, (0.5 / _d.length()) * s); // da sola: la punta va mezzo ångström oltre il bordo
+        _b.lerpVectors(_a, _b, s); // durante la replicazione il bastoncino cresce dal nastro
+      }
       setCyl(this.stickMesh, n, _a, _b, R * s);
+      if (!capOn) { this.capMesh.setMatrixAt(n, ZERO); continue; }
       _s.set(R * s, R * s, R * s); _q.identity();
       _m.compose(_b, _q, _s); this.capMesh.setMatrixAt(n, _m);
     }

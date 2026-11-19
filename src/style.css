@@ -396,3 +396,20 @@ svg.formula text.groove { font-family: var(--font); font-size: calc(16px * var(-
   .topbar { flex-wrap: wrap; }
   .actions { gap: 3px; }
 }
+
+/* ---------- didascalia e scheda della coppia: si spostano per il titolo, la didascalia si riduce ---------- */
+.cap-head { display: flex; align-items: flex-start; gap: 8px; margin: -2px -6px 0 -6px; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.cap-head h3 { flex: 1; min-width: 0; }
+.grip { flex: none; width: 12px; height: 20px; margin-top: 2px; background: radial-gradient(circle, var(--muted) 1.3px, transparent 1.8px) 0 0 / 6px 6px; opacity: 0.75; }
+.cap-min { flex: none; width: 32px; height: 32px; margin-top: -4px; font-size: calc(18px * var(--k)); line-height: 1; }
+.caption.min p { display: none; }
+.caption.min .cap-head h3 { margin-bottom: 4px; }
+.caption.dock-top { top: 12px; bottom: auto; }
+.pairbox h3.drag-h { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.pairbox h3.drag-h .grip { display: inline-block; vertical-align: -3px; margin: 0 8px 0 0; }
+.caption.dragging, .pairbox.dragging { box-shadow: var(--lift-strong), 0 0 0 1px var(--line-strong); transition: none; }
+.caption.dragging .cap-head, .pairbox.dragging .drag-h { cursor: grabbing; }
+@media (any-pointer: coarse) { .cap-min { width: 44px; height: 44px; margin-top: -8px; } }
+.pairbox { z-index: 3; } /* davanti alle scritte sulla scena (lettere degli atomi, solchi) */
+.presets button.on { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.presets button.on::before { content: "✓ "; color: var(--accent); }

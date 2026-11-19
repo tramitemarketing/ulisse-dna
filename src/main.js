@@ -266,6 +266,7 @@ function buildDuplex() {
   S.hb = Mo.hbondsBetween(S.top, 0, 1);
   S.pos = new Float32Array(S.top.atoms.length * 3);
   dview.setTopology(S.top, S.hb);
+  S.rulerFirst = null; updateFirstMark(); // gli atomi sono cambiati: il primo punto del righello si riprende
   if (S.selBp !== null && S.selBp >= n) S.selBp = null;
   dview.dimOthers = S.selBp !== null ? new Set([S.selBp]) : null;
   dview.recolor();
@@ -392,6 +393,8 @@ class Measures {
     this.group.remove(it.line, it.d1, it.d2, it.lb);
     it.lb.element.remove();
     this.items.splice(k, 1);
+    // tolta la misura di un solco, si spegne anche il suo colore
+    if ((it.preset === "minor" || it.preset === "major") && !this.items.some((x) => x.preset === it.preset)) toggleGroove(it.preset, false);
     renderMeasureList();
   }
   clear() { for (const it of [...this.items]) this.remove(it.id); }
@@ -399,6 +402,11 @@ class Measures {
 const measures = new Measures(mol);
 
 function renderMeasureList() {
+  for (const b of $$("#measurePresets [data-m]")) {
+    const on = measures.items.some((it) => it.preset === b.dataset.m);
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  }
   const ul = $("#mlist");
   ul.innerHTML = measures.items.map((it) =>
     `<li><span>${it.caption || it.title || "distanza"}</span><span><b>${fmt(it.L, 2)} Å</b> <button data-del="${it.id}" title="Togli questa misura" aria-label="Togli">${icon("close")}</button></span></li>`).join("");
@@ -424,15 +432,27 @@ function addPresetInner(kind, quiet) {
   const top = S.top, m = S.metrics, n = top.nbp, c = midBp();
   const z = (bp) => S.frames[bp].t[2];
   const side = () => (m.rP + 6);
+  // salita, giro e diametro stanno ad altezze diverse da quelle delle altre scritte (nomi dei solchi e misure
+  // già fatte): così non si coprono, da qualunque lato si guardi. Si prende la coppia libera più vicina a quella preferita.
+  const pickBp = (pref, off = 0) => {
+    const taken = [...grooveLabels.filter((l) => l.visible).map((l) => l.position.z), ...measures.items.map((it) => it.lb.position.z)];
+    const order = [...Array(n).keys()].filter((k) => k >= 1 && k <= n - 2).sort((a, b) => Math.abs(a - pref) - Math.abs(b - pref));
+    for (const k of order) if (taken.every((q) => Math.abs(q - (z(k) + off)) > 9)) return k;
+    return Math.max(1, Math.min(n - 2, pref));
+  };
+  const cRise = kind === "rise" ? pickBp(c + 7, Math.abs(m.stepRise) / 2) : 0;
+  const cPitch = kind === "pitch" ? pickBp(c - 3) : 0;
+  const cDiam = kind === "diam" ? pickBp(c - 9) : 0;
   if (kind === "rise") {
-    measures.add({ fn: () => [side(), 0, z(c)] }, { fn: () => [side(), 0, z(c + 1)] }, "salita tra due coppie");
-    focus(new THREE.Vector3(side(), 0, z(c)), 40);
+    measures.add({ fn: () => [side(), 0, z(cRise)] }, { fn: () => [side(), 0, z(cRise + 1)] }, "salita tra due coppie");
+    focus(new THREE.Vector3(side(), 0, z(cRise)), 40);
   } else if (kind === "pitch") {
-    const z0 = z(Math.max(0, c - Math.round(m.bpPerTurn / 2)));
-    measures.add({ fn: () => [side(), 0, z0] }, { fn: () => [side(), 0, z0 + S.metrics.pitch] }, `un giro = ${fmt(S.metrics.bpPerTurn, 1)} coppie`);
+    // il giro intero sta dal lato opposto alla salita, centrato a metà elica
+    const z0 = z(cPitch) - S.metrics.pitch / 2;
+    measures.add({ fn: () => [-side(), 0, z0] }, { fn: () => [-side(), 0, z0 + S.metrics.pitch] }, `un giro = ${fmt(S.metrics.bpPerTurn, 1)} coppie`);
     frame();
   } else if (kind === "diam") {
-    const p = top.idx(0, c, "P");
+    const p = top.idx(0, cDiam, "P");
     measures.add({ atom: p }, { fn: () => { const v = atomV(p); return [-v.x, -v.y, v.z]; } }, "diametro tra i fosfati");
     frame();
   } else if (kind === "c1c1") {
@@ -452,14 +472,28 @@ function addPresetInner(kind, quiet) {
     frame();
   }
 }
-$("#measurePresets").addEventListener("click", (e) => { const k = e.target.dataset.m; if (k) addPreset(k); });
+// le misure pronte sono interruttori: un clic la mette, un altro clic la toglie
+$("#measurePresets").addEventListener("click", (e) => {
+  const k = e.target.closest("[data-m]")?.dataset.m;
+  if (!k) return;
+  const mine = measures.items.filter((it) => it.preset === k);
+  if (mine.length) for (const it of mine) measures.remove(it.id);
+  else addPreset(k);
+  renderMeasureList();
+});
 
 $("#btnRuler").onclick = () => setRuler(!S.ruler);
 function setRuler(on) {
   S.ruler = on; S.rulerFirst = null;
   $("#btnRuler").classList.toggle("on", on);
   canvas.classList.toggle("ruler", on);
-  $("#rulerHint").textContent = on ? "Clicca il primo atomo." : "Premi il righello, poi clicca due atomi qualsiasi.";
+  dview.pickHints = on; dview.update(S.pos);
+  updateFirstMark();
+  $("#rulerHint").textContent = on
+    ? (dview.rep === "cartoon" || dview.rep === "simple"
+      ? "Clicca o tocca il primo punto: i fosfati sono i pallini sul nastro, e si possono prendere anche gli atomi delle basi."
+      : "Clicca o tocca il primo atomo.")
+    : "Premi il righello, poi clicca due atomi qualsiasi.";
   $("#btnRuler").lastChild.textContent = on ? "Fine misure" : "Misura tra due atomi";
   if (on && S.spinSpeed > 0) { setSpin(0); toast("Rotazione fermata per misurare con calma."); }
 }
@@ -475,6 +509,7 @@ const REP_HINT = {
 const REP_LIGHT = { simple: [0.5, 0.85], cartoon: [0.55, 0.9], bs: [0.5, 0.85], spacefill: [0.3, 0.55] };
 function setRep(rep) {
   dview.setRep(rep); rview.setRep(rep);
+  if (S.ruler) setRuler(true);
   $$("#segRep button").forEach((b) => { b.classList.toggle("on", b.dataset.rep === rep); b.setAttribute("aria-pressed", b.dataset.rep === rep ? "true" : "false"); });
   $("#repHint").innerHTML = REP_HINT[rep];
   [scene.environmentIntensity, hemi.intensity] = REP_LIGHT[rep];
@@ -530,9 +565,29 @@ function frameAll(group = mol, len) {
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 let lastPointer = null, needPick = false, hoverAtom = null, downAt = null;
-const hoverMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35, depthWrite: false }));
+const hoverMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xffc29a, transparent: true, opacity: 0.55, depthWrite: false, depthTest: false }));
+hoverMesh.renderOrder = 20;
+const hoverHalo = new THREE.Mesh(hoverMesh.geometry, new THREE.MeshBasicMaterial({ color: 0xff7b3a, transparent: true, opacity: 0.2, depthWrite: false, depthTest: false }));
+hoverHalo.scale.setScalar(1.6); hoverHalo.renderOrder = 19;
+hoverMesh.add(hoverHalo);
 hoverMesh.visible = false;
 mol.add(hoverMesh);
+// primo punto scelto col righello: resta segnato finché non si sceglie il secondo
+const firstMark = new THREE.Mesh(hoverMesh.geometry, new THREE.MeshBasicMaterial({ color: 0xff7b3a, transparent: true, opacity: 0.85, depthWrite: false, depthTest: false }));
+firstMark.renderOrder = 21; firstMark.visible = false;
+mol.add(firstMark);
+function hoverRadius(v, at) {
+  if (v.rep === "spacefill") return ELEMENTS[at.el].vdw * 1.1;
+  if (v.rep === "bs") return Math.max(0.75, ELEMENTS[at.el].bs * 2.4);
+  return at.name === "P" ? 1.6 : 0.85; // Libro e Semplice: il fosfato sta dentro il nastro, serve un segno più grande
+}
+function updateFirstMark() {
+  const a = S.rulerFirst;
+  firstMark.visible = a !== null && S.ruler;
+  if (!firstMark.visible) return;
+  firstMark.position.copy(atomV(a));
+  firstMark.scale.setScalar(hoverRadius(dview, S.top.atoms[a]) * 0.8);
+}
 
 function localRay(e, group) {
   const r = canvas.getBoundingClientRect();
@@ -568,10 +623,10 @@ canvas.addEventListener("pointerup", (e) => {
   if (S.mode === "replica") return;
   if (S.ruler) {
     if (a === null) return;
-    if (S.rulerFirst === null) { S.rulerFirst = a; $("#rulerHint").textContent = `Primo punto: ${atomDesc(a)}. Ora clicca il secondo.`; }
+    if (S.rulerFirst === null) { S.rulerFirst = a; updateFirstMark(); $("#rulerHint").textContent = `Primo punto: ${atomDesc(a)}. Ora clicca il secondo.`; }
     else if (a !== S.rulerFirst) {
       const it = measures.add({ atom: S.rulerFirst }, { atom: a }, `${atomDesc(S.rulerFirst)} → ${atomDesc(a)}`);
-      S.rulerFirst = null;
+      S.rulerFirst = null; updateFirstMark();
       $("#rulerHint").textContent = `Misurato: ${fmt(it.L)} Å. Clicca altri due atomi o premi di nuovo il righello per finire.`;
     }
     return;
@@ -598,8 +653,7 @@ function doPick() {
   const top = v.top, at = top.atoms[a], nt = top.nts[at.nt];
   if (hoverMesh.parent !== g) g.add(hoverMesh);
   hoverMesh.position.set(v.pos[a * 3], v.pos[a * 3 + 1], v.pos[a * 3 + 2]);
-  const r = v.rep === "spacefill" ? ELEMENTS[at.el].vdw * 1.08 : Math.max(0.7, ELEMENTS[at.el].bs * 2.2);
-  hoverMesh.scale.setScalar(r);
+  hoverMesh.scale.setScalar(hoverRadius(v, at));
   hoverMesh.visible = true;
   const st = top.strands[at.strand];
   const rna = v.ntRNA[at.nt] && nt.base === "T";
@@ -895,7 +949,7 @@ function renderPairBox() {
   const ref = S.refSeq[i];
   const changed = S.refSeq.length === S.seq.length && ref !== b;
   box.innerHTML = `<button class="icon-btn close" title="Chiudi" aria-label="Chiudi">${icon("close")}</button>
-    <h3>Coppia ${i + 1} · <span class="pairglyph"><span class="${b}">${b}</span>${hb === 3 ? "≡" : "="}<span class="${c}">${c}</span></span> · ${hb} legami a idrogeno</h3>
+    <h3 class="drag-h" title="Trascina per spostare la scheda"><span class="grip" aria-hidden="true"></span>Coppia ${i + 1} · <span class="pairglyph"><span class="${b}">${b}</span>${hb === 3 ? "≡" : "="}<span class="${c}">${c}</span></span> · ${hb} legami a idrogeno</h3>
     <div>Filamento I: <b>${BASE_INFO[b].nome}</b> (${BASE_INFO[b].tipo}) · filamento II: <b>${BASE_INFO[c].nome}</b> (${BASE_INFO[c].tipo})</div>
     ${cod ? `<div>Fa parte del codone ${ci / 3 + 1}: <b>${cod}</b> → ${translate(cod).nome}</div>` : ""}
     <div class="mutbtns">Cambia la base: ${"ATGC".split("").map((x) => `<button data-mut="${x}" class="base ${x}" ${x === b ? "disabled" : ""} aria-label="Metti ${BASE_INFO[x].nome}">${x}</button>`).join("")}
@@ -904,7 +958,59 @@ function renderPairBox() {
     <div class="tools"><button class="btn small ${S.showFormula ? "on" : ""}" data-formula="1">${icon("flask")}${S.showFormula ? "Nascondi la formula" : "Formula chimica"}</button></div>
     ${S.showFormula ? `<div class="formula-wrap">${formulaPanel(b, c)}</div>` : ""}`;
   box.hidden = false;
+  arrangeOverlays();
 }
+
+// ----- finestre sopra la scena: non si coprono, e si possono spostare col dito o col mouse -----
+const capState = { dx: 0, dy: 0, moved: false }, pairState = { dx: 0, dy: 0, moved: false };
+function resetDrag(el, st) { st.dx = st.dy = 0; st.moved = false; el.style.translate = ""; }
+function makeDraggable(el, handleSel, st) {
+  let d = null;
+  el.addEventListener("pointerdown", (e) => {
+    const h = e.target.closest(handleSel);
+    if (!h || e.button > 0 || e.target.closest("button, a, input, select, textarea")) return;
+    e.preventDefault();
+    d = { id: e.pointerId, x: e.clientX, y: e.clientY, dx: st.dx, dy: st.dy, r: el.getBoundingClientRect() };
+    try { h.setPointerCapture(e.pointerId); } catch (err) { /* si trascina lo stesso */ }
+    el.classList.add("dragging");
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!d || e.pointerId !== d.id) return;
+    // la finestra resta sempre dentro lo schermo
+    const mx = Math.max(4 - d.r.left, Math.min(innerWidth - 4 - d.r.right, e.clientX - d.x));
+    const my = Math.max(4 - d.r.top, Math.min(innerHeight - 4 - d.r.bottom, e.clientY - d.y));
+    st.dx = d.dx + mx; st.dy = d.dy + my; st.moved = true;
+    el.style.translate = `${st.dx}px ${st.dy}px`;
+  });
+  const end = (e) => { if (!d || (e && e.pointerId !== d.id)) return; d = null; el.classList.remove("dragging"); };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+  el.addEventListener("lostpointercapture", end);
+}
+makeDraggable($("#caption"), ".cap-head", capState);
+makeDraggable($("#pairbox"), ".drag-h", pairState);
+// se la didascalia e la scheda della coppia si toccherebbero, la scheda si accorcia (e scorre dentro);
+// sul telefono la didascalia sale in alto. Se qualcuno le ha spostate a mano, si lasciano dove sono.
+function arrangeOverlays() {
+  const cap = $("#caption"), box = $("#pairbox");
+  box.style.maxHeight = "";
+  cap.classList.remove("dock-top");
+  if (box.hidden) resetDrag(box, pairState);
+  if (cap.hidden) resetDrag(cap, capState);
+  if (cap.hidden || box.hidden || capState.moved || pairState.moved) return;
+  if (stage.clientWidth <= 860) cap.classList.add("dock-top");
+  const a = cap.getBoundingClientRect(), b = box.getBoundingClientRect();
+  if (a.left < b.right && b.left < a.right && b.top < a.bottom + 12) box.style.maxHeight = Math.max(160, b.bottom - a.bottom - 12) + "px";
+}
+$("#capMin").onclick = () => {
+  const cap = $("#caption"), min = !cap.classList.contains("min");
+  cap.classList.toggle("min", min);
+  $("#capMin").setAttribute("aria-expanded", min ? "false" : "true");
+  $("#capMin").setAttribute("aria-label", min ? "Riapri la didascalia" : "Riduci la didascalia");
+  $("#capMin").textContent = min ? "+" : "−";
+  arrangeOverlays();
+};
+new ResizeObserver(() => arrangeOverlays()).observe(stage);
 $("#pairbox").addEventListener("click", (e) => {
   const t = e.target.closest("button") || e.target;
   if (t.dataset.formula) { S.showFormula = !S.showFormula; renderPairBox(); return; }
@@ -1175,6 +1281,7 @@ function showCaption(title, text, nav) {
   n.innerHTML = nav || "";
   n.hidden = !nav;
   c.hidden = false;
+  arrangeOverlays();
 }
 
 // ======================= giro guidato =======================
@@ -1197,6 +1304,7 @@ const TOUR = [
   { title: "Ora tocca a te", text: "Prova la <b>replicazione</b> e il confronto di <b>scala</b> dalle linguette in alto, oppure scrivi la tua sequenza e cambia le basi una alla volta.", run() { setSpin(22); frameAll(); } },
 ];
 function tourStep(k) {
+  $("#intro").hidden = true;
   S.tour = { k };
   const st = TOUR[k];
   grooveState.pin.clear();
@@ -1212,6 +1320,7 @@ function endTour() {
   if (!S.tour) return;
   S.tour = null;
   $("#caption").hidden = S.mode !== "replica";
+  arrangeOverlays();
   $("#btnTour").innerHTML = `${icon("play")}<span>Giro guidato</span>`;
 }
 $("#caption").addEventListener("click", (e) => {
