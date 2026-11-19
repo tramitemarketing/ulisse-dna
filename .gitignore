@@ -1,3 +1,8 @@
 node_modules/
 .wrangler/
 deploy/
+
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example

@@ -24,6 +24,14 @@ node tools/check.mjs # controlla le misure (salita, solchi, legami H…)
 
 Per vederlo basta aprire `dist/dna-elica.html` nel browser.
 
+## Pubblicarlo
+
+Il sito sta su Cloudflare (Workers con file statici, la versione nuova di Pages): https://ulisse-dna.tramitemarketing-it.workers.dev
+
+```bash
+npm run pubblica     # ricostruisce e pubblica (serve `npx wrangler login` sull'account giusto)
+```
+
 ## Fonti
 
 - Coordinate: PDB 1BNA (Drew et al., PNAS 1981), 440D (A-DNA, 1999), 1DCG (Z-DNA, Gessner et al. 1989).
