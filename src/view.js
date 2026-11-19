@@ -21,6 +21,22 @@ const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _d = new THREE.Vector3
 const _c = new THREE.Color();
 const ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
 
+// Bordo più scuro dove la superficie gira via dall'occhio: separa sfere che si toccano
+// (vista «Sfere piene») e dà rilievo a tubi e bastoncini.
+function withEdge(mat, strength) {
+  mat.userData.edge = { value: strength };
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uEdge = mat.userData.edge;
+    sh.fragmentShader = sh.fragmentShader
+      .replace("void main() {", "uniform float uEdge;\nvoid main() {")
+      .replace("#include <opaque_fragment>", "outgoingLight *= mix(1.0 - uEdge, 1.0, smoothstep(0.05, 0.7, abs(dot(normalize(normal), normalize(vViewPosition)))));\n#include <opaque_fragment>");
+  };
+  return mat;
+}
+const EDGE = { cartoon: 0.22, simple: 0.3, bs: 0.32, spacefill: 0.55 };
+// Atomo del bordo che si appaia con l'altra base (N1 delle purine, N3 delle pirimidine)
+const EDGE_ATOM = { pur: "N1", pyr: "N3" };
+
 function setCyl(mesh, i, a, b, r) {
   _d.subVectors(b, a);
   const L = _d.length();
@@ -42,12 +58,14 @@ export class MoleculeView {
     this.showBackbone = true;
     this.showBases = true;
     this.dimOthers = null; // Set di bp da evidenziare
-    this.sphereGeo = new THREE.SphereGeometry(1, 18, 12);
+    this.sphereGeo = new THREE.SphereGeometry(1, 22, 14);
     this.cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12, 1, false);
-    this.mat = new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.05 });
+    this.mat = withEdge(new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.05 }), EDGE.cartoon);
     this.hbMat = new THREE.MeshStandardMaterial({ color: "#f3ecdd", emissive: "#6b5f4a", emissiveIntensity: 0.5, roughness: 0.6 });
     this.ringMat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.5, metalness: 0.0, transparent: true, opacity: 0.93 });
-    this.tubeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.35, metalness: 0.1 });
+    this.tubeMat = withEdge(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.35, metalness: 0.1 }), 0.25);
+    this.stickMat = withEdge(new THREE.MeshStandardMaterial({ roughness: 0.38, metalness: 0.04 }), EDGE.simple);
+    this.tubeCapMat = withEdge(new THREE.MeshStandardMaterial({ roughness: 0.35, metalness: 0.1 }), 0.25);
     this.tubes = [];
   }
 
@@ -55,12 +73,22 @@ export class MoleculeView {
     this.top = top;
     this.hbonds = hbonds;
     const nA = top.atoms.length, nB = top.bonds.length;
-    for (const k of ["atomMesh", "bondMesh", "hbMesh", "ringMesh"]) if (this[k]) { this.group.remove(this[k]); this[k].geometry !== this.sphereGeo && this[k].geometry !== this.cylGeo && this[k].geometry.dispose(); }
+    for (const k of ["atomMesh", "bondMesh", "hbMesh", "ringMesh", "stickMesh", "capMesh", "tubeCapMesh"]) if (this[k]) {
+      this.group.remove(this[k]);
+      if (this[k].geometry !== this.sphereGeo && this[k].geometry !== this.cylGeo) this[k].geometry.dispose();
+      if (this[k].isInstancedMesh) this[k].dispose(); // libera i buffer delle istanze
+    }
     this.atomMesh = new THREE.InstancedMesh(this.sphereGeo, this.mat, nA);
     // per ogni legame: due metà + un connettore per nucleotide (modalità libro)
     this.bondMesh = new THREE.InstancedMesh(this.cylGeo, this.mat, nB * 2 + top.nts.length);
     this.hbMesh = new THREE.InstancedMesh(this.cylGeo, this.hbMat, Math.max(1, hbonds.length * 3));
-    for (const m of [this.atomMesh, this.bondMesh, this.hbMesh]) { m.frustumCulled = false; this.group.add(m); }
+    // vista semplice: un bastoncino colorato per base, con la punta arrotondata
+    this.stickMesh = new THREE.InstancedMesh(this.cylGeo, this.stickMat, top.nts.length);
+    this.capMesh = new THREE.InstancedMesh(this.sphereGeo, this.stickMat, top.nts.length);
+    // tappi arrotondati alle estremità dei nastri: senza, il tubo finisce aperto e da quel lato si vede dentro
+    this.tubeCapMesh = new THREE.InstancedMesh(this.sphereGeo, this.tubeCapMat, top.nts.length * 2 + 2);
+    this.tubeCapMesh.count = 0;
+    for (const m of [this.atomMesh, this.bondMesh, this.hbMesh, this.stickMesh, this.capMesh, this.tubeCapMesh]) { m.frustumCulled = false; m.castShadow = m.receiveShadow = true; this.group.add(m); }
     // anelli delle basi
     let nTri = 0;
     for (const nt of top.nts) for (const r of RINGS[nt.cls]) nTri += r.length;
@@ -70,6 +98,7 @@ export class MoleculeView {
     g.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(nTri * 9), 3));
     this.ringMesh = new THREE.Mesh(g, this.ringMat);
     this.ringMesh.frustumCulled = false;
+    this.ringMesh.castShadow = this.ringMesh.receiveShadow = true;
     this.group.add(this.ringMesh);
     this.atomScale = new Float32Array(nA).fill(1);
     this.hbVisible = new Uint8Array(hbonds.length).fill(1);
@@ -115,10 +144,23 @@ export class MoleculeView {
       this.bondMesh.setColorAt(k++, _c.setRGB(this.colors[c1 * 3], this.colors[c1 * 3 + 1], this.colors[c1 * 3 + 2]).lerp(new THREE.Color(this.atomColor(top.idx(nt.strand, nt.bp, "C4'"))), 0.0));
     }
     this.bondMesh.instanceColor.needsUpdate = true;
+    // bastoncini della vista semplice: colore della base anche se si colora per elemento
+    for (let n = 0; n < top.nts.length; n++) {
+      const nt = top.nts[n];
+      const e = top.idx(nt.strand, nt.bp, EDGE_ATOM[nt.cls]);
+      if (this.colorMode === "element") {
+        _c.set(BASE_INFO[this.ntRNA[n] && nt.base === "T" ? "U" : nt.base].colore);
+        if (this.dimOthers && !this.dimOthers.has(nt.bp)) _c.multiplyScalar(0.07);
+      } else _c.setRGB(this.colors[e * 3], this.colors[e * 3 + 1], this.colors[e * 3 + 2]);
+      this.stickMesh.setColorAt(n, _c);
+      this.capMesh.setColorAt(n, _c);
+    }
+    this.stickMesh.instanceColor.needsUpdate = true;
+    this.capMesh.instanceColor.needsUpdate = true;
     if (this.pos) this.update(this.pos);
   }
 
-  setRep(rep) { this.rep = rep; if (this.pos) this.update(this.pos); }
+  setRep(rep) { this.rep = rep; this.mat.userData.edge.value = EDGE[rep]; if (this.pos) this.update(this.pos); }
   setColorMode(m) { this.colorMode = m; this.recolor(); }
   setDim(set) { this.dimOthers = set; this.recolor(); }
 
@@ -138,6 +180,9 @@ export class MoleculeView {
       let r = 0;
       if (rep === "bs") r = ELEMENTS[at.el].bs;
       else if (rep === "spacefill") r = ELEMENTS[at.el].vdw;
+      // «Libro»: niente palline, solo giunture tonde grandi quanto i bastoncini, così i pezzi si raccordano
+      // (sul C1′ quella del connettore verso lo scheletro, che altrimenti finirebbe tagliato netto)
+      else if (rep === "cartoon" && this.showBases) r = at.name === "C1'" ? (this.showBackbone ? 0.32 : 0.17) : at.isBase ? 0.17 : 0;
       r *= this.atomScale[a];
       if (!this.layerOn(a)) r = 0;
       if (r === 0) { this.atomMesh.setMatrixAt(a, ZERO); continue; }
@@ -145,7 +190,7 @@ export class MoleculeView {
       _m.compose(_p, _q, _s); this.atomMesh.setMatrixAt(a, _m);
     }
     this.atomMesh.instanceMatrix.needsUpdate = true;
-    this.atomMesh.visible = rep !== "cartoon"; // nella vista «Libro» gli atomi non si disegnano
+    this.atomMesh.visible = rep !== "simple"; // nella vista «Semplice» gli atomi non si disegnano
     // --- legami ---
     let k = 0;
     for (const [i, j] of top.bonds) {
@@ -173,7 +218,7 @@ export class MoleculeView {
     let h = 0;
     for (let n = 0; n < this.hbonds.length; n++) {
       const [i, j] = this.hbonds[n];
-      const on = this.showHB && this.showBases && rep !== "spacefill" && this.hbVisible[n] && this.atomScale[i] > 0.99 && this.atomScale[j] > 0.99;
+      const on = this.showHB && this.showBases && (rep === "cartoon" || rep === "bs") && this.hbVisible[n] && this.atomScale[i] > 0.99 && this.atomScale[j] > 0.99;
       V(i, _a); V(j, _b);
       for (const [t0, t1] of [[0.12, 0.3], [0.41, 0.59], [0.7, 0.88]]) {
         const p0 = new THREE.Vector3().lerpVectors(_a, _b, t0), p1 = new THREE.Vector3().lerpVectors(_a, _b, t1);
@@ -181,6 +226,8 @@ export class MoleculeView {
       }
     }
     this.hbMesh.instanceMatrix.needsUpdate = true;
+    // --- bastoncini della vista semplice ---
+    this.updateSticks(pos);
     // --- anelli ---
     this.updateRings(pos);
     // --- tubi dello scheletro ---
@@ -198,6 +245,33 @@ export class MoleculeView {
       (pos[pSelf * 3 + 1] + pos[useNext * 3 + 1]) / 2,
       (pos[pSelf * 3 + 2] + pos[useNext * 3 + 2]) / 2,
     ];
+  }
+
+  // Vista «Semplice»: per ogni base un bastoncino dal nastro dello scheletro fino al bordo
+  // che si appaia, un po' più in là, così le due metà di un piolo quasi si toccano.
+  updateSticks(pos) {
+    const top = this.top;
+    const show = this.rep === "simple" && this.showBases;
+    const R = 0.62;
+    for (let n = 0; n < top.nts.length; n++) {
+      const nt = top.nts[n];
+      const c1 = top.idx(nt.strand, nt.bp, "C1'");
+      const e = top.idx(nt.strand, nt.bp, EDGE_ATOM[nt.cls]);
+      const s = Math.min(this.atomScale[c1], this.atomScale[e]);
+      if (!show || s < 0.001) { this.stickMesh.setMatrixAt(n, ZERO); this.capMesh.setMatrixAt(n, ZERO); continue; }
+      const t = this.showBackbone ? this.connectorTarget(nt, pos) : [pos[c1 * 3], pos[c1 * 3 + 1], pos[c1 * 3 + 2]];
+      _a.set(t[0], t[1], t[2]);
+      _b.set(pos[e * 3], pos[e * 3 + 1], pos[e * 3 + 2]);
+      _d.subVectors(_b, _a);
+      const L = _d.length();
+      _b.addScaledVector(_d, (0.5 / L) * s); // la punta va mezzo ångström oltre l'atomo del bordo
+      _b.lerpVectors(_a, _b, s); // durante la replicazione il bastoncino cresce dal nastro
+      setCyl(this.stickMesh, n, _a, _b, R * s);
+      _s.set(R * s, R * s, R * s); _q.identity();
+      _m.compose(_b, _q, _s); this.capMesh.setMatrixAt(n, _m);
+    }
+    this.stickMesh.instanceMatrix.needsUpdate = true;
+    this.capMesh.instanceMatrix.needsUpdate = true;
   }
 
   updateRings(pos) {
@@ -241,7 +315,8 @@ export class MoleculeView {
   updateTubes(pos) {
     for (const t of this.tubes) { this.group.remove(t); t.geometry.dispose(); }
     this.tubes = [];
-    if (this.rep !== "cartoon" || !this.showBackbone) return;
+    this.tubeCapMesh.count = 0;
+    if ((this.rep !== "cartoon" && this.rep !== "simple") || !this.showBackbone) return;
     const top = this.top;
     for (let s = 0; s < top.strands.length; s++) {
       const st = top.strands[s];
@@ -291,8 +366,22 @@ export class MoleculeView {
     }
     geo.setAttribute("color", new THREE.BufferAttribute(colArr, 3));
     const mesh = new THREE.Mesh(geo, this.tubeMat);
+    mesh.castShadow = mesh.receiveShadow = true;
     this.group.add(mesh);
     this.tubes.push(mesh);
+    // un tappo a ogni estremità, dello stesso colore del nastro in quel punto
+    const caps = this.tubeCapMesh;
+    for (const [t, c] of [[0, cols[0]], [1, cols[cols.length - 1]]]) {
+      if (caps.count >= caps.instanceMatrix.count) break;
+      curve.getPoint(t, _p);
+      _s.set(0.95, 0.95, 0.95); _q.identity();
+      _m.compose(_p, _q, _s);
+      caps.setMatrixAt(caps.count, _m);
+      caps.setColorAt(caps.count, c);
+      caps.count++;
+    }
+    caps.instanceMatrix.needsUpdate = true;
+    if (caps.instanceColor) caps.instanceColor.needsUpdate = true;
   }
 
   // Selezione: atomo più vicino lungo un raggio (coordinate locali del gruppo)

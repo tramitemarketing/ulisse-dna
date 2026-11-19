@@ -15,6 +15,9 @@ const $$ = (s) => [...document.querySelectorAll(s)];
 const fmt = (x, d = 2) => (x === null || x === undefined || !isFinite(x) ? "—" : x.toFixed(d).replace(".", ","));
 const ease = (u) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
 const isTouch = matchMedia("(pointer: coarse)").matches;
+// avanzamento della schermata di caricamento (vedi index.html)
+const loader = (text, p) => window.__loader?.set(p, text);
+loader("Accendo il laboratorio", 0.3);
 
 // ======================= renderer e scena =======================
 const canvas = $("#c3d");
@@ -24,6 +27,8 @@ renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
 renderer.setClearColor(0x000000, 0);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const labelRenderer = new CSS2DRenderer({ element: $("#labels") });
 
 const scene = new THREE.Scene();
@@ -33,10 +38,31 @@ scene.environmentIntensity = 0.55;
 const camera = new THREE.PerspectiveCamera(40, 1, 0.3, 6000);
 camera.position.set(0, 18, 165);
 scene.add(camera);
-scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x1b2036, 0.9));
+const hemi = new THREE.HemisphereLight(0xdfe8ff, 0x1b2036, 0.9);
+scene.add(hemi);
+// Luce principale: arriva da dove la porterebbe la camera (in alto a destra, davanti), ma sta
+// sempre fuori dalla molecola e fa ombre morbide e leggere, che danno profondità alle forme.
+const KEY_OFFSET = new THREE.Vector3(58, 62, 16); // più di lato: le ombre cadono dove si vedono
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.7);
-keyLight.position.set(40, 60, 30);
-camera.add(keyLight);
+scene.add(keyLight, keyLight.target);
+keyLight.castShadow = true;
+const anyTouch = matchMedia("(any-pointer: coarse)").matches;
+keyLight.shadow.mapSize.set(anyTouch ? 1024 : 2048, anyTouch ? 1024 : 2048);
+keyLight.shadow.intensity = 0.7;
+keyLight.shadow.bias = -0.0004;
+keyLight.shadow.normalBias = 0.06;
+const _kd = new THREE.Vector3();
+function updateKeyLight() {
+  const pos = activeView().pos;
+  let r2 = 0;
+  if (pos) for (let i = 0; i < pos.length; i += 3) { const d = pos[i] * pos[i] + pos[i + 1] * pos[i + 1] + pos[i + 2] * pos[i + 2]; if (d > r2) r2 = d; }
+  const R = Math.sqrt(r2) + 3; // raggio della molecola attorno al centro, più l'ingombro di un atomo
+  _kd.copy(KEY_OFFSET).applyQuaternion(camera.quaternion).add(camera.position);
+  if (_kd.lengthSq() < 1) _kd.set(0, 1, 0);
+  keyLight.position.copy(_kd.normalize()).multiplyScalar(R + 40);
+  const sc = keyLight.shadow.camera;
+  if (Math.abs(sc.right - R) > 0.5) { sc.left = sc.bottom = -R; sc.right = sc.top = R; sc.near = 1; sc.far = 2 * R + 80; sc.updateProjectionMatrix(); }
+}
 const rim = new THREE.DirectionalLight(0x9db4ff, 0.6);
 rim.position.set(-60, -20, -40);
 camera.add(rim);
@@ -107,6 +133,133 @@ const axisLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashed
 axisLine.visible = false;
 mol.add(axisLine);
 
+// ----- solchi: passando sopra (o toccando) la scritta, il solco si colora -----
+const GROOVES = ["major", "minor"];
+const GROOVE_NAME = { major: "solco maggiore", minor: "solco minore" };
+const grooveFx = {};
+// la passata velata mostra solo la metà del solco rivolta verso chi guarda, se no sembra una colonna piena
+const grooveCZ = { value: 0 };
+function frontOnly(mat) {
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uCZ = grooveCZ;
+    sh.vertexShader = sh.vertexShader
+      .replace("void main() {", "varying float vVZ;\nvoid main() {")
+      .replace("#include <project_vertex>", "#include <project_vertex>\nvVZ = mvPosition.z;");
+    sh.fragmentShader = sh.fragmentShader
+      .replace("void main() {", "uniform float uCZ;\nvarying float vVZ;\nvoid main() {")
+      .replace("#include <opaque_fragment>", "diffuseColor.a *= smoothstep(-1.0, 6.0, vVZ - uCZ);\n#include <opaque_fragment>");
+  };
+  return mat;
+}
+for (const k of GROOVES) {
+  const color = k === "major" ? 0xffb14a : 0x5cc8ff;
+  // due passate: quella piena dove il solco si vede, e una velata che traspare dagli atomi davanti
+  const m = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.38, depthWrite: false, side: THREE.DoubleSide }));
+  const ghost = new THREE.Mesh(m.geometry, frontOnly(new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.16, depthWrite: false, depthTest: false, side: THREE.DoubleSide })));
+  m.visible = false; m.renderOrder = 5; m.frustumCulled = false;
+  ghost.renderOrder = 6; ghost.frustumCulled = false;
+  m.add(ghost);
+  mol.add(m); grooveFx[k] = m;
+}
+// quali solchi sono fissati (clic o tocco) e quale è sotto il puntatore
+const grooveState = { hover: null, pin: new Set() };
+grooveLabels.forEach((l, i) => {
+  const key = GROOVES[i], el = l.element;
+  el.dataset.k = key;
+  el.tabIndex = 0;
+  el.setAttribute("role", "button");
+  el.setAttribute("aria-pressed", "false");
+  el.title = `Clicca o tocca per colorare il ${GROOVE_NAME[key]}`;
+  const hover = (on) => { grooveState.hover = on ? key : grooveState.hover === key ? null : grooveState.hover; updateGrooves(); };
+  el.addEventListener("pointerenter", () => hover(true));
+  el.addEventListener("pointerleave", () => hover(false));
+  el.addEventListener("focus", () => hover(true));
+  el.addEventListener("blur", () => hover(false));
+  el.addEventListener("click", () => { toggleGroove(key); });
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleGroove(key); } });
+});
+function toggleGroove(key, on) {
+  const want = on ?? !grooveState.pin.has(key);
+  if (want) grooveState.pin.add(key); else grooveState.pin.delete(key);
+  updateGrooves();
+}
+// Una «grondaia» trasparente tra i due scheletri: va da un fosfato del filamento I a quello del
+// filamento II che gli sta di fronte attraverso il solco, e scende verso l'asse in mezzo.
+function grooveGeometry(key) {
+  const pr = S.metrics?.[key + "Pair"];
+  if (!pr) return null;
+  const top = S.top, n = top.nbp;
+  const off = top.atoms[pr[1]].bp - top.atoms[pr[0]].bp;
+  const A = [], B = [];
+  for (let k = 0; k < n; k++) {
+    const i = top.idx(0, k, "P"), j = top.idx(1, k + off, "P");
+    if (i === undefined || j === undefined) continue;
+    A.push(atomV(i)); B.push(atomV(j));
+  }
+  if (A.length < 2) return null;
+  const cA = new THREE.CatmullRomCurve3(A), cB = new THREE.CatmullRomCurve3(B);
+  const NS = (A.length - 1) * 6 + 1, NU = 14;
+  const verts = new Float32Array(NS * (NU + 1) * 3), index = [];
+  const pa = new THREE.Vector3(), pb = new THREE.Vector3();
+  const frames = S.frames;
+  for (let s = 0; s < NS; s++) {
+    const t = s / (NS - 1);
+    cA.getPoint(t, pa); cB.getPoint(t, pb);
+    const ta = Math.atan2(pa.y, pa.x), tb = Math.atan2(pb.y, pb.x);
+    // da che parte girare: verso il solco giusto, cioè dove punta l'asse x della coppia a quell'altezza
+    // (l'asse x delle coppie guarda il solco maggiore)
+    const zm = (pa.z + pb.z) / 2;
+    let F = frames[0], best = Infinity;
+    for (const f of frames) { const dz = Math.abs(f.t[2] - zm); if (dz < best) { best = dz; F = f; } }
+    const want = Math.atan2(F.R[1][0], F.R[0][0]) + (key === "major" ? 0 : Math.PI);
+    let d = Math.atan2(Math.sin(tb - ta), Math.cos(tb - ta));
+    const alt = d - Math.sign(d || 1) * 2 * Math.PI;
+    if (Math.cos(ta + alt / 2 - want) > Math.cos(ta + d / 2 - want)) d = alt;
+    const ra = Math.hypot(pa.x, pa.y), rb = Math.hypot(pb.x, pb.y);
+    for (let u = 0; u <= NU; u++) {
+      const f = u / NU, th = ta + d * f;
+      // bordi appena fuori dai fosfati, centro che scende nel solco
+      const r = (ra + (rb - ra) * f + 1.2) * (1 - 0.36 * Math.sin(Math.PI * f));
+      const o = (s * (NU + 1) + u) * 3;
+      verts[o] = r * Math.cos(th); verts[o + 1] = r * Math.sin(th); verts[o + 2] = pa.z + (pb.z - pa.z) * f;
+    }
+  }
+  for (let s = 0; s < NS - 1; s++) for (let u = 0; u < NU; u++) {
+    const a = s * (NU + 1) + u, b = a + NU + 1;
+    index.push(a, b, a + 1, b, b + 1, a + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+  g.setIndex(index);
+  return g;
+}
+function updateGrooves() {
+  const inMol = (S.mode === "esplora" || S.mode === "forme") && S.top && !S.flying;
+  for (const [i, k] of GROOVES.entries()) {
+    const on = inMol && (grooveState.pin.has(k) || grooveState.hover === k);
+    const m = grooveFx[k];
+    if (on) { const g = grooveGeometry(k) || new THREE.BufferGeometry(); m.geometry.dispose(); m.geometry = g; m.children[0].geometry = g; }
+    m.visible = !!on;
+    const el = grooveLabels[i].element;
+    el.classList.toggle("on", !!on);
+    el.setAttribute("aria-pressed", grooveState.pin.has(k) ? "true" : "false");
+  }
+}
+
+// ----- maniglia in cima all'elica: trascinando si allunga o si accorcia, una coppia alla volta -----
+const LEN_MIN = 4, LEN_MAX = 80;
+const lenEl = document.createElement("div");
+lenEl.className = "lenhandle";
+lenEl.tabIndex = 0;
+lenEl.setAttribute("role", "slider");
+lenEl.setAttribute("aria-label", "Lunghezza della doppia elica, in coppie di basi");
+lenEl.setAttribute("aria-valuemin", LEN_MIN);
+lenEl.setAttribute("aria-valuemax", LEN_MAX);
+lenEl.title = "Trascina su o giù per allungare o accorciare l'elica, una coppia alla volta (con la tastiera: frecce su e giù)";
+lenEl.innerHTML = `<svg class="ico" aria-hidden="true"><use href="#i-grip"/></svg><span class="lh-n"></span>`;
+const lenHandle = new CSS2DObject(lenEl);
+mol.add(lenHandle);
+
 function buildDuplex() {
   const n = S.seq.length;
   S.top = Mo.buildTopology(Mo.duplexStrands(S.seq), n);
@@ -130,6 +283,7 @@ function updateGeometry() {
   updateLabels();
   updateSymbols();
   measures.update();
+  if (grooveFx.major.visible || grooveFx.minor.visible) updateGrooves();
 }
 
 function atomV(i, pos = S.pos) { return new THREE.Vector3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]); }
@@ -163,6 +317,12 @@ function updateLabels() {
   axisLine.geometry.setFromPoints([new THREE.Vector3(0, 0, z0), new THREE.Vector3(0, 0, z1)]);
   axisLine.computeLineDistances();
   axisLine.visible = S.axis && S.mode !== "replica";
+  // maniglia della lunghezza, sopra la cima dell'elica
+  lenHandle.position.set(0, 0, S.frames[n - 1].t[2] + 13);
+  lenHandle.visible = (S.mode === "esplora" || S.mode === "forme") && !S.flying;
+  lenEl.querySelector(".lh-n").textContent = `${n} coppie`;
+  lenEl.setAttribute("aria-valuenow", n);
+  lenEl.setAttribute("aria-valuetext", `${n} coppie di basi`);
 }
 
 // simboli chimici sugli atomi della coppia scelta (vista «Atomi»)
@@ -200,7 +360,7 @@ class Measures {
     d1.renderOrder = d2.renderOrder = 10;
     const lb = label("", "meas");
     this.group.add(line, d1, d2, lb);
-    const it = { id: ++this.uid, a, b, caption, kind, line, d1, d2, lb };
+    const it = { id: ++this.uid, a, b, caption, kind, line, d1, d2, lb, preset: presetTag };
     this.items.push(it);
     this.update(); renderMeasureList();
     return it;
@@ -244,7 +404,7 @@ function renderMeasureList() {
     `<li><span>${it.caption || it.title || "distanza"}</span><span><b>${fmt(it.L, 2)} Å</b> <button data-del="${it.id}" title="Togli questa misura" aria-label="Togli">${icon("close")}</button></span></li>`).join("");
 }
 $("#mlist").addEventListener("click", (e) => { const id = e.target.closest("[data-del]")?.dataset.del; if (id) measures.remove(+id); });
-$("#btnClearM").onclick = () => measures.clear();
+$("#btnClearM").onclick = () => { measures.clear(); grooveState.pin.clear(); updateGrooves(); };
 
 function atomDesc(i) {
   const at = S.top.atoms[i];
@@ -252,36 +412,44 @@ function atomDesc(i) {
 }
 
 function midBp() { return Math.floor(S.top.nbp / 2); }
-function addPreset(kind) {
+let presetTag = null; // quale misura pronta sta aggiungendo le righe (per rifarla se cambia la lunghezza)
+function addPreset(kind, quiet = false) {
+  presetTag = kind;
+  try { addPresetInner(kind, quiet); } finally { presetTag = null; }
+  if ((kind === "minor" || kind === "major") && S.metrics?.[kind + "Pair"]) toggleGroove(kind, true);
+}
+function addPresetInner(kind, quiet) {
+  // in silenzio (quando si rifà dopo un cambio di lunghezza) niente avvisi e la camera resta dov'è
+  const say = quiet ? () => {} : toast, focus = quiet ? () => {} : focusLocal, frame = quiet ? () => {} : () => frameAll();
   const top = S.top, m = S.metrics, n = top.nbp, c = midBp();
   const z = (bp) => S.frames[bp].t[2];
   const side = () => (m.rP + 6);
   if (kind === "rise") {
     measures.add({ fn: () => [side(), 0, z(c)] }, { fn: () => [side(), 0, z(c + 1)] }, "salita tra due coppie");
-    focusLocal(new THREE.Vector3(side(), 0, z(c)), 40);
+    focus(new THREE.Vector3(side(), 0, z(c)), 40);
   } else if (kind === "pitch") {
     const z0 = z(Math.max(0, c - Math.round(m.bpPerTurn / 2)));
     measures.add({ fn: () => [side(), 0, z0] }, { fn: () => [side(), 0, z0 + S.metrics.pitch] }, `un giro = ${fmt(S.metrics.bpPerTurn, 1)} coppie`);
-    frameAll();
+    frame();
   } else if (kind === "diam") {
     const p = top.idx(0, c, "P");
     measures.add({ atom: p }, { fn: () => { const v = atomV(p); return [-v.x, -v.y, v.z]; } }, "diametro tra i fosfati");
-    frameAll();
+    frame();
   } else if (kind === "c1c1") {
     measures.add({ atom: top.idx(0, c, "C1'") }, { atom: top.idx(1, c, "C1'") }, "C1′–C1′, larghezza del «piolo»");
-    focusLocal(atomV(top.idx(0, c, "C1'")).add(atomV(top.idx(1, c, "C1'"))).multiplyScalar(0.5), 34);
+    focus(atomV(top.idx(0, c, "C1'")).add(atomV(top.idx(1, c, "C1'"))).multiplyScalar(0.5), 34);
   } else if (kind === "hbgc" || kind === "hbat") {
     const want = kind === "hbgc" ? ["G", "C"] : ["A", "T"];
     let bp = -1;
     for (let d = 0; d < n && bp < 0; d++) for (const k of [c + d, c - d]) if (k >= 0 && k < n && want.includes(S.seq[k]) && bp < 0) bp = k;
-    if (bp < 0) { toast(`In questa sequenza non c'è una coppia ${want.join("-")}.`); return; }
+    if (bp < 0) { say(`In questa sequenza non c'è una coppia ${want.join("-")}.`); return; }
     for (const [i, j, b] of S.hb) if (b === bp) measures.add({ atom: i }, { atom: j }, `legame H ${S.top.atoms[i].name}···${S.top.atoms[j].name}`, "hb");
-    focusLocal(atomV(top.idx(0, bp, "C1'")).add(atomV(top.idx(1, bp, "C1'"))).multiplyScalar(0.5), 26);
+    focus(atomV(top.idx(0, bp, "C1'")).add(atomV(top.idx(1, bp, "C1'"))).multiplyScalar(0.5), 26);
   } else if (kind === "minor" || kind === "major") {
     const pr = m[kind + "Pair"];
-    if (!pr) { toast("Elica troppo corta per misurare i solchi."); return; }
+    if (!pr) { say("Elica troppo corta per misurare i solchi."); return; }
     measures.add({ atom: pr[0] }, { atom: pr[1] }, kind === "minor" ? "solco minore" : "solco maggiore", "groove");
-    frameAll();
+    frame();
   }
 }
 $("#measurePresets").addEventListener("click", (e) => { const k = e.target.dataset.m; if (k) addPreset(k); });
@@ -298,14 +466,18 @@ function setRuler(on) {
 
 // ======================= vista: rappresentazione, colori, livelli =======================
 const REP_HINT = {
+  simple: `Solo lo scheletro e un bastoncino per ogni base: <b class="A">A</b> adenina, <b class="T">T</b> timina, <b class="G">G</b> guanina, <b class="C">C</b> citosina. Le purine (A, G) sono più lunghe delle pirimidine (T, C), così ogni piolo misura uguale.`,
   cartoon: "Come nei libri: scheletro a nastro e basi come anelli.",
   bs: "Ogni pallina è un atomo (gli idrogeni non si vedono, come nei cristalli ai raggi X).",
   spacefill: "Ogni atomo con il suo ingombro vero (raggio di van der Waals): così si vedono bene i solchi.",
 };
+// luce d'ambiente per vista: con le sfere piene serve meno luce diffusa, se no diventa un blocco unico
+const REP_LIGHT = { simple: [0.5, 0.85], cartoon: [0.55, 0.9], bs: [0.5, 0.85], spacefill: [0.3, 0.55] };
 function setRep(rep) {
   dview.setRep(rep); rview.setRep(rep);
-  $$("#segRep button").forEach((b) => b.classList.toggle("on", b.dataset.rep === rep));
-  $("#repHint").textContent = REP_HINT[rep];
+  $$("#segRep button").forEach((b) => { b.classList.toggle("on", b.dataset.rep === rep); b.setAttribute("aria-pressed", b.dataset.rep === rep ? "true" : "false"); });
+  $("#repHint").innerHTML = REP_HINT[rep];
+  [scene.environmentIntensity, hemi.intensity] = REP_LIGHT[rep];
   updateSymbols();
 }
 $("#segRep").addEventListener("click", (e) => { const r = e.target.dataset.rep; if (r) setRep(r); });
@@ -375,11 +547,21 @@ function activeGroup() { return S.mode === "replica" ? repGroup : mol; }
 
 canvas.addEventListener("pointermove", (e) => { lastPointer = e; needPick = true; });
 canvas.addEventListener("pointerleave", () => { lastPointer = null; needPick = true; });
-canvas.addEventListener("pointerdown", (e) => { downAt = [e.clientX, e.clientY]; $("#panel").classList.remove("open"); });
+let tapTimer = null;
+canvas.addEventListener("pointerdown", (e) => {
+  downAt = [e.clientX, e.clientY]; $("#panel").classList.remove("open");
+  if (e.pointerType !== "mouse") { lastPointer = null; needPick = true; clearTimeout(tapTimer); }
+});
 canvas.addEventListener("pointerup", (e) => {
   if (!downAt || S.mode === "scala" || S.flying) return;
   const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
   downAt = null;
+  // al tocco non c'è il «passa sopra»: un tocco fermo mostra la scheda dell'atomo, un trascinamento la nasconde
+  if (e.pointerType !== "mouse") {
+    lastPointer = moved > 10 ? null : e; needPick = true;
+    clearTimeout(tapTimer);
+    if (lastPointer) tapTimer = setTimeout(() => { if (lastPointer === e) { lastPointer = null; needPick = true; } }, 4000);
+  }
   if (moved > 6) return;
   const v = activeView();
   const a = v.pick(localRay(e, activeGroup()));
@@ -448,12 +630,139 @@ function setSequence(seq, opts = {}) {
     toast("La forma Z si forma solo con sequenze alternate C-G: torno alla forma B.");
   }
   if (!opts.keepSel) S.selBp = null;
+  if (!opts.mutation) { S.lenTail = []; grooveState.pin.clear(); }
   buildDuplex();
   if (!opts.keepCam) frameAll();
   renderPairBox();
+  updateGrooves();
   S.rep = null;
 }
 function isZok(seq) { return /^(CG)+$/.test(seq); }
+
+// ----- lunghezza: allungare e accorciare dalla cima (estremità 3′ del filamento I) -----
+S.lenTail = []; // lettere tolte accorciando: allungando di nuovo tornano le stesse
+function lenStep() { return S.form === "Z" ? 2 : 1; } // la forma Z vuole coppie C-G alternate
+function clampLen(n) { const st = lenStep(); return Math.max(LEN_MIN, Math.min(LEN_MAX, Math.round(n / st) * st)); }
+function nextBase(seq) {
+  if (S.form === "Z") return seq[seq.length - 1] === "C" ? "G" : "C";
+  return "ACGT"[Math.floor(Math.random() * 4)];
+}
+function setLength(n) {
+  const cur = S.seq.length;
+  n = clampLen(n);
+  if (n === cur) return false;
+  let seq = S.seq;
+  let ref = S.refSeq && S.refSeq.length === cur ? S.refSeq : seq;
+  if (n > cur) {
+    for (let k = cur; k < n; k++) {
+      let pair = S.lenTail.pop();
+      if (pair && S.form === "Z" && pair[0] !== nextBase(seq)) pair = null;
+      const b = pair ? pair[0] : nextBase(seq);
+      seq += b; ref += pair ? pair[1] : b;
+    }
+  } else {
+    for (let k = cur - 1; k >= n; k--) S.lenTail.push([seq[k], ref[k]]);
+    seq = seq.slice(0, n); ref = ref.slice(0, n);
+  }
+  // le misure sopravvivono: quelle pronte si rifanno, quelle col righello restano sugli stessi atomi
+  const kept = measures.items.map((it) => ({
+    preset: it.preset, caption: it.caption, kind: it.kind,
+    ends: [it.a, it.b].map((e) => (e.atom !== undefined ? S.top.atoms[e.atom] : null)),
+  }));
+  S.seq = seq; S.refSeq = ref;
+  $("#txtSeq").value = seq;
+  sel.value = "custom";
+  $("#presetNote").textContent = `Elica di ${n} coppie. Per cambiarla trascina la maniglia in cima all'elica.`;
+  buildDuplex();
+  const redo = new Set();
+  for (const k of kept) {
+    if (k.preset) { redo.add(k.preset); continue; }
+    if (k.ends.some((a) => !a)) continue;
+    const ids = k.ends.map((a) => (a.bp < n ? S.top.idx(a.strand, a.bp, a.name) : undefined));
+    if (ids.every((i) => i !== undefined)) measures.add({ atom: ids[0] }, { atom: ids[1] }, k.caption, k.kind);
+  }
+  for (const p of redo) addPreset(p, true);
+  renderPairBox();
+  updateGrooves();
+  S.rep = null;
+  return true;
+}
+// dove cade un punto dell'elica sullo schermo (pixel della pagina) e se l'elica entra tutta nella vista
+function toScreen(local) {
+  const v = mol.localToWorld(local.clone()).project(camera);
+  const r = canvas.getBoundingClientRect();
+  return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height, ndc: v };
+}
+function helixFits() {
+  const n = S.top.nbp;
+  return [S.frames[0].t[2] - 10, S.frames[n - 1].t[2] + 16].every((z) => {
+    const v = toScreen(new THREE.Vector3(0, 0, z)).ndc;
+    return Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1 && v.z < 1;
+  });
+}
+function fitDistance() {
+  const L = S.top.nbp * Math.abs(S.metrics?.stepRise || 3.3) + 30;
+  const fit = (L / 2) / Math.tan((camera.fov * Math.PI) / 360) * 1.08;
+  const aspectFix = camera.aspect < 1 ? 1 / camera.aspect * 0.75 : 1;
+  return Math.max(60, fit * Math.max(1, aspectFix * 0.6));
+}
+// se prima si vedeva tutta, dopo il cambio la si rimette al centro, intera
+function settleLength(wasFull) {
+  if (!wasFull) return;
+  const dist = Math.max(camera.position.distanceTo(controls.target), fitDistance());
+  tweenTo(new THREE.Vector3(0, 0, 0), dist, 0.6);
+}
+let lenDrag = null;
+lenEl.addEventListener("pointerdown", (e) => {
+  if (e.button > 0 || !S.top) return;
+  e.preventDefault(); e.stopPropagation();
+  try { lenEl.setPointerCapture(e.pointerId); } catch (err) { /* qualche browser lo rifiuta: si trascina lo stesso */ }
+  lenEl.focus({ preventScroll: true });
+  controls.enabled = false;
+  S.tween = null;
+  const n0 = S.seq.length, rise = Math.abs(S.metrics?.stepRise || 3.38);
+  const zTop = S.frames[n0 - 1].t[2];
+  const a = toScreen(new THREE.Vector3(0, 0, zTop)), b = toScreen(new THREE.Vector3(0, 0, zTop + rise * 4));
+  let ux = (b.x - a.x) / 4, uy = (b.y - a.y) / 4;
+  let px = Math.hypot(ux, uy);
+  if (px < 7) { ux = 0; uy = -7; px = 7; } // elica vista quasi dall'alto: basta muoversi in verticale
+  lenDrag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, n0, ux: ux / px, uy: uy / px, px, rise, wasFull: helixFits() };
+  lenEl.classList.add("drag");
+  $("#tooltip").hidden = true;
+});
+lenEl.addEventListener("pointermove", (e) => {
+  if (!lenDrag || e.pointerId !== lenDrag.id) return;
+  const along = (e.clientX - lenDrag.x0) * lenDrag.ux + (e.clientY - lenDrag.y0) * lenDrag.uy;
+  const before = S.seq.length;
+  if (setLength(lenDrag.n0 + along / lenDrag.px)) {
+    // la base dell'elica resta ferma sullo schermo e la cima segue il dito
+    const dy = ((S.seq.length - before) * lenDrag.rise) / 2;
+    camera.position.y -= dy; controls.target.y -= dy;
+  }
+});
+function endLenDrag(e) {
+  if (!lenDrag || (e && e.pointerId !== lenDrag.id)) return;
+  const wasFull = lenDrag.wasFull;
+  lenDrag = null;
+  lenEl.classList.remove("drag");
+  controls.enabled = S.mode !== "scala" && !S.flying;
+  settleLength(wasFull);
+}
+lenEl.addEventListener("pointerup", endLenDrag);
+lenEl.addEventListener("pointercancel", endLenDrag);
+lenEl.addEventListener("lostpointercapture", endLenDrag);
+lenEl.addEventListener("keydown", (e) => {
+  const st = lenStep();
+  const delta = { ArrowUp: st, ArrowRight: st, ArrowDown: -st, ArrowLeft: -st, PageUp: 5 * st, PageDown: -5 * st }[e.key];
+  let n = null;
+  if (delta) n = S.seq.length + delta;
+  else if (e.key === "Home") n = LEN_MIN;
+  else if (e.key === "End") n = LEN_MAX;
+  if (n === null) return;
+  e.preventDefault(); e.stopPropagation();
+  const wasFull = helixFits();
+  if (setLength(n) && wasFull && !helixFits()) settleLength(true);
+});
 
 const sel = $("#selPreset");
 sel.innerHTML = PRESETS.map((p) => `<option value="${p.id}">${p.nome}</option>`).join("") + `<option value="custom">— la mia sequenza —</option>`;
@@ -486,19 +795,21 @@ function renderStats() {
   const tm = n < 14 ? 2 * at + 4 * gc : 64.9 + (41 * (gc - 16.4)) / n;
   const ff = duplexFormula(s, [...s].map((b) => COMPLEMENT[b]).join(""));
   const rise = S.metrics?.stepRise || 3.34;
-  $("#stats").innerHTML = `
-    <dt>Coppie di basi</dt><dd>${n}</dd>
-    <dt>Contenuto G+C</dt><dd>${fmt((100 * gc) / n, 0)} %</dd>
-    <dt>Legami a idrogeno</dt><dd>${2 * at + 3 * gc} (${at}×2 + ${gc}×3)</dd>
-    <dt>Lunghezza</dt><dd>${fmt((n * rise) / 10, 1)} nm</dd>
-    <dt title="La temperatura a cui metà delle doppie eliche si separa in due filamenti">Temperatura di fusione (stima)</dt><dd>≈ ${fmt(tm, 0)} °C</dd>
-    <dt>Massa molare</dt><dd>${Math.round(molarMass(ff)).toLocaleString("it-IT")} g/mol</dd>
-    <dt title="Quanti atomi di ogni elemento ci sono in tutta la molecola (acido neutro, idrogeni compresi)">Formula bruta di tutta la doppia elica</dt><dd></dd><dd class="formula">${formulaText(ff)}</dd>`;
-  $("#stats").title = n < 14 ? "Temperatura di fusione con la regola di Wallace: 2·(A+T) + 4·(G+C)" : "Temperatura di fusione: 64,9 + 41·(G+C − 16,4)/N (stima per DNA in soluzione salina)";
+  const tmTitle = n < 14 ? "Temperatura di fusione con la regola di Wallace: 2·(A+T) + 4·(G+C)" : "Temperatura di fusione: 64,9 + 41·(G+C − 16,4)/N (stima per DNA in soluzione salina)";
+  const tile = (k, v, title = "", cls = "") => `<div class="st${cls}"${title ? ` title="${title}"` : ""}><dt>${k}</dt><dd>${v}</dd></div>`;
+  $("#stats").innerHTML =
+    tile("Coppie di basi", n) +
+    tile("Contenuto G+C", `${fmt((100 * gc) / n, 0)} %`) +
+    tile("Legami a idrogeno", `${2 * at + 3 * gc} <small>${at}×2 + ${gc}×3</small>`) +
+    tile("Lunghezza", `${fmt((n * rise) / 10, 1)} nm`) +
+    tile("Fusione (stima)", `≈ ${fmt(tm, 0)} °C`, "La temperatura a cui metà delle doppie eliche si separa in due filamenti. " + tmTitle) +
+    tile("Massa molare", `${Math.round(molarMass(ff)).toLocaleString("it-IT")} g/mol`) +
+    tile("Formula bruta di tutta la doppia elica", `<span class="formula">${formulaText(ff)}</span>`, "Quanti atomi di ogni elemento ci sono in tutta la molecola (acido neutro, idrogeni compresi)", " wide");
 }
 
 function renderStrip() {
   const s = S.seq, n = s.length, ref = S.refSeq;
+  const focusBp = Math.min(n - 1, S.selBp ?? S.stripFocus ?? 0);
   const cells = [];
   const put = (html, cls, row, col, span = 1, data = "") => cells.push(`<div class="${cls}" style="grid-row:${row};grid-column:${col}${span > 1 ? " / span " + span : ""}" ${data}>${html}</div>`);
   put("", "end", 1, 1); put("5′", "end", 2, 1); put("", "end", 3, 1); put("3′", "end", 4, 1);
@@ -507,9 +818,9 @@ function renderStrip() {
     const mut = ref && ref.length === n && ref[i] !== b ? " mut" : "";
     const selc = S.selBp === i ? " sel" : "";
     put(i === 0 || (i + 1) % 5 === 0 ? i + 1 : "", "num", 1, col);
-    put(b, `b ${b}${mut}${selc}`, 2, col, 1, `data-bp="${i}" title="coppia ${i + 1}: ${b}-${c}"`);
+    put(b, `b ${b}${mut}${selc}`, 2, col, 1, `data-bp="${i}" role="button" tabindex="${i === focusBp ? 0 : -1}" aria-pressed="${S.selBp === i}" aria-label="coppia ${i + 1}: ${b} con ${c}" title="coppia ${i + 1}: ${b}-${c}"`);
     put(b === "G" || b === "C" ? "┆┆┆" : "┆┆", "hb", 3, col);
-    put(c, `b ${c}${mut}${selc}`, 4, col, 1, `data-bp="${i}" title="coppia ${i + 1}: ${b}-${c}"`);
+    put(c, `b ${c}${mut}${selc}`, 4, col, 1, `data-bp="${i}" aria-hidden="true" title="coppia ${i + 1}: ${b}-${c}"`);
   }
   put("3′", "end", 2, n + 2); put("5′", "end", 4, n + 2);
   for (let i = 0; i + 3 <= n; i += 3) {
@@ -518,8 +829,25 @@ function renderStrip() {
     const changed = refCod !== cod;
     put(`${cod} <b>${aa.sigla}</b>`, "cod" + (changed ? " changed" : ""), 5, i + 2, 3, `title="codone ${i / 3 + 1}: ${cod} → ${aa.nome}"`);
   }
-  $("#stripScroll").innerHTML = `<div class="seqgrid" style="grid-template-columns:auto repeat(${n},22px) auto">${cells.join("")}</div>`;
+  const hadFocus = document.activeElement?.closest?.("#stripScroll");
+  $("#stripScroll").innerHTML = `<div class="seqgrid" style="grid-template-columns:auto repeat(${n},var(--cell)) auto">${cells.join("")}</div>`;
+  if (hadFocus) $(`#stripScroll [data-bp="${focusBp}"][tabindex]`)?.focus({ preventScroll: true });
 }
+$("#stripScroll").addEventListener("keydown", (e) => {
+  const cell = e.target.closest("[data-bp][tabindex]");
+  if (!cell) return;
+  const n = S.seq.length, bp = +cell.dataset.bp;
+  const to = { ArrowRight: bp + 1, ArrowLeft: bp - 1, Home: 0, End: n - 1 }[e.key];
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectBp(bp, true); return; }
+  if (to === undefined) return;
+  e.preventDefault();
+  const k = Math.max(0, Math.min(n - 1, to));
+  S.stripFocus = k;
+  cell.tabIndex = -1;
+  const next = $(`#stripScroll [data-bp="${k}"][tabindex]`);
+  next.tabIndex = 0; next.focus();
+  next.scrollIntoView({ block: "nearest", inline: "nearest" });
+});
 $("#stripScroll").addEventListener("click", (e) => {
   const bp = e.target.dataset.bp;
   if (bp !== undefined) selectBp(+bp, true);
@@ -629,7 +957,7 @@ function renderFormPanel() {
   const ft = FORM_TEXT[S.form];
   $("#formText").innerHTML = `<h3>${ft.t}</h3>${ft.p.map((x) => `<p>${x}</p>`).join("")}<p style="font-size:12px">I valori della tabella sono misurati sul modello costruito dai cristalli (${Mo.FORM_DATA.A.pdb}, ${Mo.FORM_DATA.B.pdb}, ${Mo.FORM_DATA.Z.pdb}) e possono scostarsi dai valori «da libro», che vengono dalle fibre: per la forma A i libri danno un solco maggiore di circa 3 Å e un minore di circa 11 Å. Coordinate da: ${Mo.FORM_SOURCES[S.form]}.</p>`;
 }
-function syncFormButtons() { $$("#segForm button").forEach((b) => b.classList.toggle("on", b.dataset.form === S.form)); renderFormPanel(); }
+function syncFormButtons() { $$("#segForm button").forEach((b) => { b.classList.toggle("on", b.dataset.form === S.form); b.setAttribute("aria-pressed", b.dataset.form === S.form ? "true" : "false"); }); renderFormPanel(); }
 function morphTo(k) {
   if (k === S.form && !S.morph) return;
   if (k === "Z" && !isZok(S.seq)) {
@@ -803,7 +1131,7 @@ function updateMolScaleBar() {
 function setMode(m) {
   stopFly();
   S.mode = m;
-  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.mode === m));
+  $$(".tab").forEach((t) => { t.classList.toggle("active", t.dataset.mode === m); t.setAttribute("aria-selected", t.dataset.mode === m ? "true" : "false"); });
   $$(".mode-panel").forEach((p) => (p.hidden = p.dataset.for !== m));
   const inMol = m === "esplora" || m === "forme";
   mol.visible = inMol;
@@ -819,6 +1147,7 @@ function setMode(m) {
   for (const it of measures.items) for (const o of [it.line, it.d1, it.d2, it.lb]) o.visible = m !== "replica";
   for (const k of Object.keys(enzPool)) { enzPool[k].l.visible = false; }
   updateLabels();
+  updateGrooves();
   updateSymbols();
   renderPairBox();
   if (m === "forme") renderFormPanel();
@@ -870,7 +1199,9 @@ const TOUR = [
 function tourStep(k) {
   S.tour = { k };
   const st = TOUR[k];
+  grooveState.pin.clear();
   st.run();
+  updateGrooves();
   const nav = `<span class="count">${k + 1} / ${TOUR.length}</span>` +
     (k > 0 ? `<button class="btn ghost small" data-t="-1">Indietro</button>` : "") +
     (k < TOUR.length - 1 ? `<button class="btn accent small" data-t="1">Avanti</button>` : `<button class="btn accent small" data-t="end">Fine</button>`) +
@@ -892,9 +1223,26 @@ $("#caption").addEventListener("click", (e) => {
 $("#btnTour").onclick = () => { if (S.tour) endTour(); else { $("#btnTour").innerHTML = `${icon("stop")}<span>Esci dal giro</span>`; tourStep(0); } };
 
 // ======================= barra in alto =======================
-$("#btnHelp").onclick = () => ($("#help").hidden = false);
-$("#btnHelpClose").onclick = () => ($("#help").hidden = true);
-$("#help").addEventListener("click", (e) => { if (e.target.id === "help") $("#help").hidden = true; });
+// finestra d'aiuto: il fuoco entra nella finestra e torna al pulsante quando si chiude
+function openHelp() { $("#help").hidden = false; $("#btnHelpClose").focus(); }
+function closeHelp() { if ($("#help").hidden) return; $("#help").hidden = true; $("#btnHelp").focus(); }
+$("#btnHelp").onclick = openHelp;
+$("#btnHelpClose").onclick = closeHelp;
+$("#help").addEventListener("click", (e) => { if (e.target.id === "help") closeHelp(); });
+// testo e pulsanti grandi, per la LIM e il proiettore (la scelta resta; sulle LIM parte già acceso, vedi index.html)
+function syncBig() {
+  const on = document.documentElement.dataset.size === "big";
+  $("#btnBig").setAttribute("aria-pressed", on ? "true" : "false");
+  $("#btnBig").classList.toggle("on", on);
+}
+$("#btnBig").onclick = () => {
+  const on = document.documentElement.dataset.size !== "big";
+  document.documentElement.dataset.size = on ? "big" : "normal";
+  try { localStorage.setItem("ulisse-size", on ? "big" : "normal"); } catch (e) { /* niente */ }
+  syncBig();
+  toast(on ? "Testo e pulsanti grandi: comodi sulla LIM." : "Testo e pulsanti di misura normale.");
+};
+syncBig();
 $("#sourcesText").innerHTML = Object.values(Mo.FORM_SOURCES).join(".<br>") + ".<br>Le coordinate dello scheletro sono la media dei nucleotidi di ogni cristallo, rifinita perché i legami tra un nucleotide e l'altro tornino alla lunghezza vera (1,60 Å) su un'elica regolare. Le basi sono quelle standard: le distanze dei legami a idrogeno (2,9–3,0 Å) escono da sole.";
 $("#btnFull").onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen?.(); };
 $("#btnTheme").onclick = () => {
@@ -932,6 +1280,7 @@ function startFly() {
   look.pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
   $("#flyhud").hidden = false; $("#tooltip").hidden = true;
   canvas.classList.add("flying");
+  updateLabels(); updateGrooves();
   $("#btnFly").lastChild.textContent = "Esci dal volo";
   $("#panel").classList.remove("open");
 }
@@ -943,6 +1292,7 @@ function stopFly() {
   flyMove.f = flyMove.r = flyMove.u = 0;
   $("#flyhud").hidden = true;
   canvas.classList.remove("flying");
+  if (S.top) { updateLabels(); updateGrooves(); }
   const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
   controls.target.copy(camera.position).addScaledVector(dir, 30);
   controls.enabled = S.mode !== "scala";
@@ -979,7 +1329,7 @@ $$("#flyhud [data-move]").forEach((b) => {
 });
 const FLY_KEYS = ["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "ShiftLeft", "ShiftRight"];
 addEventListener("keydown", (e) => {
-  if (e.code === "Escape") { $("#help").hidden = true; stopFly(); }
+  if (e.code === "Escape") { closeHelp(); stopFly(); }
   if (!S.flying || (e.target instanceof Element && e.target.closest("textarea, input, select"))) return;
   if (FLY_KEYS.includes(e.code)) { keys[e.code] = true; e.preventDefault(); }
 });
@@ -1010,9 +1360,25 @@ new ResizeObserver(resize).observe(stage);
 
 // ======================= ciclo =======================
 let last = performance.now();
+const perf = { from: 0, t: 0, n: 0, stage: 0 };
+function watchSpeed(now, raw) {
+  if (perf.stage >= 2 || document.hidden) return;
+  if (!perf.from) perf.from = now + 2500; // i primi secondi preparano gli shader: non contano
+  if (now < perf.from || raw > 1000) return; // pause lunghe (scheda nascosta) non contano
+  perf.t += raw; perf.n++;
+  if (perf.t < 2500) return;
+  const avg = perf.t / perf.n;
+  perf.t = perf.n = 0;
+  if (avg < 45) return; // più di ~22 fotogrammi al secondo: va bene così
+  if (perf.stage === 0) { keyLight.castShadow = false; perf.stage = 1; }
+  else if (renderer.getPixelRatio() > 1) { renderer.setPixelRatio(1); resize(); perf.stage = 2; }
+  else perf.stage = 2;
+}
 function loop(now) {
-  const dt = Math.min(0.1, (now - last) / 1000);
+  const raw = now - last;
+  const dt = Math.min(0.1, raw / 1000);
   last = now;
+  watchSpeed(now, raw);
   if (S.mode === "scala") {
     scaleScene.render(dt);
     updateScaleUI(dt);
@@ -1052,6 +1418,8 @@ function loop(now) {
   if (Math.abs(S.viewOff) > 0.5) camera.setViewOffset(stage.clientWidth, stage.clientHeight, S.viewOff, 0, stage.clientWidth, stage.clientHeight);
   else if (camera.view && camera.view.enabled) camera.clearViewOffset();
   if (needPick || (lastPointer && S.spinSpeed > 0)) doPick();
+  updateKeyLight();
+  if (grooveFx.major.visible || grooveFx.minor.visible) grooveCZ.value = new THREE.Vector3().applyMatrix4(camera.matrixWorldInverse).z;
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   updateMolScaleBar();
@@ -1059,14 +1427,21 @@ function loop(now) {
 }
 
 // ======================= avvio =======================
+loader("Costruisco la doppia elica, atomo per atomo", 0.5);
 $("#txtSeq").value = S.seq;
-setSpin(22);
+setSpin(matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 22);
 buildDuplex();
 renderFormPanel();
 resize();
 frameAll();
 camera.position.copy(S.tween.toP); controls.target.copy(S.tween.toT); S.tween = null;
-requestAnimationFrame(loop);
+loader("Preparo luci e ombre", 0.7);
+{
+  // le LIM sono lente: gli shader si preparano senza bloccare la pagina, poi parte il disegno
+  const go = () => requestAnimationFrame((t) => { last = t; loop(t); loader("Ultimi ritocchi", 0.95); window.__loader?.done(); });
+  updateKeyLight();
+  if (renderer.compileAsync) renderer.compileAsync(scene, camera).then(go, go); else go();
+}
 // primi passi: compare finché non lo chiudi
 (() => {
   let seen = false;
@@ -1077,4 +1452,4 @@ requestAnimationFrame(loop);
   $("#introClose").onclick = () => { box.hidden = true; try { localStorage.setItem("ulisse-intro", "1"); } catch (e) { /* niente */ } };
   $("#introTour").onclick = () => { $("#introClose").onclick(); $("#btnTour").click(); };
 })();
-window.__dna = { S, measures, dview, rview, setMode, morphTo, addPreset, selectBp, setRep, scaleScene, renderer, scene, camera, labelRenderer }; // per i test
+window.__dna = { S, measures, dview, rview, setMode, morphTo, addPreset, selectBp, setRep, scaleScene, renderer, scene, camera, labelRenderer, controls, setLength, toggleGroove }; // per i test
